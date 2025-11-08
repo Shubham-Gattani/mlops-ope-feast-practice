@@ -1,0 +1,411 @@
+Create the BigQuery dataset if it does not exist.
+
+bq --project_id=mlops-iris-week1-graded --location=US mk -d feast_iris
+
+Purpose: Feast needs an offline store where it keeps historical feature data for training and backfills. In your setup, the offline store is BigQuery, so we must provide Feast with a dataset where it can create tables and run point-in-time joins. Without a dataset, Feast cannot store or query offline features.
+
+=====================
+
+Next step: Load your CSV into BigQuery so Feast can use it as the offline feature table.
+
+Why this step: Feast does not read CSVs directly. It expects the feature source to live inside the offline store (BigQuery). So we upload the CSV into a table that Feast will reference in the feature definition.
+
+Run this in a Jupyter cell:
+
+bq load \
+  --project_id=mlops-iris-week1-graded \
+  --location=US \
+  --source_format=CSV \
+  --autodetect \
+  feast_iris.iris_features \
+  ./iris_data_adapted_for_feast.csv
+  
+  
+==================================
+
+Next step: **Create the basic Feast repo structure** locally so Feast knows where to put the registry, feature definitions, and online SQLite store.
+
+Why this step:
+Feast expects a directory containing its config (`feature_store.yaml`) and your feature/label definitions. This is the minimal structure needed for any Feast project.
+
+In a Jupyter cell run:
+
+```bash
+mkdir -p feast_artifacts
+cd feast_artifacts
+feast init iris_repo
+```
+
+Explanation:
+
+* `feast_artifacts/` keeps everything isolated.
+* `feast init iris_repo` creates the standard Feast layout:
+
+  * `feature_store.yaml`
+  * example feature files (we will replace these)
+  * registry placeholder
+  * online store placeholder
+
+Tell me when this completes.
+
+===================================================
+
+Good. Next step: **Replace the default Feast config with one that uses BigQuery (offline) + SQLite (online).**
+
+Why this step:
+`feature_store.yaml` tells Feast *where* to store offline features, *where* to serve online features, and *where* to keep the registry. Right now it points to the example repo’s config; we must overwrite it.
+
+Create/overwrite `iris_repo/feature_repo/feature_store.yaml` with the following minimal config:
+
+```yaml
+project: iris_repo
+registry: ../registry.db
+
+provider: local
+
+offline_store:
+    type: bigquery
+    project_id: mlops-iris-week1-graded
+    dataset: feast_iris
+
+online_store:
+    type: sqlite
+    path: ../online_store.db
+```
+
+Explanation:
+
+* `project`: Feast project name.
+* `registry`: SQLite file storing metadata about features.
+* `offline_store`: Points to your BigQuery project + dataset.
+* `online_store`: SQLite file for serving fresh features online.
+
+Create this file and tell me when done.
+
+==============================================
+
+Next step: **Define the feature view that points to your BigQuery table.**
+
+Why this step:
+Feast needs a Python definition describing:
+
+* the entity key (`iris_id`)
+* the timestamp column (`event_timestamp`)
+* which columns are features
+* the BigQuery table to read from
+
+Create a new file:
+
+`iris_repo/feature_repo/iris_features.py`
+
+Paste this:
+
+```python
+from feast import Entity, FeatureView, Field, BigQuerySource
+from feast.types import Float32, String
+
+iris_source = BigQuerySource(
+    table="mlops-iris-week1-graded.feast_iris.iris_features",
+    timestamp_field="event_timestamp",
+    # created_timestamp_column="created_timestamp", # REMOVED FROM FEAST 0.31+
+)
+
+iris_entity = Entity(
+    name="iris_id",
+    join_keys=["iris_id"],
+    description="Iris identifier",
+)
+
+iris_feature_view = FeatureView(
+    name="iris_features_view",
+    entities=[iris_entity],
+    ttl=None,
+    schema=[
+        Field(name="sepal_length", dtype=Float32),
+        Field(name="sepal_width", dtype=Float32),
+        Field(name="petal_length", dtype=Float32),
+        Field(name="petal_width", dtype=Float32),
+        Field(name="species", dtype=String),
+    ],
+    online=True,
+    source=iris_source,
+)
+
+```
+
+Explanation:
+
+* `BigQuerySource` points Feast to the table you loaded.
+* `Entity` explains the join key.
+* `FeatureView` declares which fields are features and where they come from.
+* `online=True` ensures these will be materialized into the SQLite store.
+
+Create the file and confirm when done.
+
+
+======================================================
+
+Next step: **Apply the Feast repo.**
+
+Why this step:
+`feast apply` reads your feature definitions and writes them into the registry (`registry.db`). Until this step, Feast does not know your feature view exists.
+
+Run this inside the repo directory:
+
+```bash
+cd feast_artifacts/iris_repo/feature_repo
+feast apply
+```
+
+Expected output:
+
+* It shows “Registered entity iris_id”
+* It shows “Registered feature view iris_features_view”
+
+Run it and tell me what you see.
+
+
+=================================
+Good. Your repo is now correctly registered.
+Next step: **Materialize historical data into the SQLite online store**, so that online feature retrieval works.
+
+Why this step:
+Feast separates offline (BigQuery) and online (SQLite).
+After defining a feature view, you must *materialize* recent feature values from BigQuery → SQLite.
+Without this, online retrieval returns nothing.
+
+Run:
+
+```bash
+feast materialize-incremental "$(date +%Y-%m-%d)"
+```
+
+Explanation:
+
+* This pulls all feature values up to **today** from BigQuery.
+* Writes them into `online_store.db`.
+
+Run this and tell me when done.
+
+====================================================
+**What happens when we run `feast apply`**
+
+`feast apply` does the following:
+
+1. **Parses your repo**
+   Reads all Python feature files and the `feature_store.yaml`.
+
+2. **Validates definitions**
+   Ensures entities, feature views, schemas, data sources, and types are valid.
+
+3. **Writes metadata into the registry** (`registry.db`)
+   This includes:
+
+   * Entities
+   * Feature Views
+   * Data Sources
+   * Feature schemas
+   * Relationships between them
+     The registry is the *metadata backbone* of Feast.
+
+4. **Creates or updates tables for online stores**
+   For SQLite:
+   Feast creates a table for each feature view, e.g.
+   `iris_repo_iris_features_view`.
+
+5. **Reports what changed**
+   Example: “Created entity …”, “Created feature view …”.
+
+Nothing is materialized during `apply`; it only sets up metadata and online-store table structure.
+
+---
+
+**What happens when we run
+`feast materialize-incremental "$(date +%Y-%m-%d)"`**
+
+This step actually **moves offline data → online store**.
+
+Specifically:
+
+1. **Determine the time window**
+   It looks at:
+
+   * The last time this feature view was materialized (from registry)
+   * Up to the time you provide (today)
+
+   For ttl=None → Feast defaults the start date to 1 year ago.
+
+2. **Query BigQuery**
+   It runs a point-in-time-safe query against the table:
+   `mlops-iris-week1-graded.feast_iris.iris_features`
+
+   It pulls:
+
+   * `iris_id` (entity)
+   * all declared features
+   * rows up to the provided timestamp
+
+3. **Transforms + groups rows by entity key**
+   For each `iris_id`, the latest row within the time window becomes the “online” value.
+
+4. **Writes results into SQLite**
+   The table created earlier (e.g. `iris_repo_iris_features_view`) is now filled with key–value pairs:
+
+   ```
+   iris_id → {sepal_width, sepal_length, ...}
+   ```
+
+5. **Updates registry with the last materialization timestamp**
+   So the next materialize-incremental only pulls new data.
+
+In short:
+
+* `feast apply` → *creates metadata + table structures*
+* `feast materialize-incremental` → *loads actual feature values into the online store*
+
+Next step (very small): test online retrieval. Just tell me when you’re ready.
+
+=======================================================
+
+Run this small test to confirm online feature retrieval:
+
+```python
+from feast import FeatureStore
+
+fs = FeatureStore(repo_path="./feast_artifacts/iris_repo/feature_repo") # repo path = path to feature_repo
+
+features = fs.get_online_features(
+    features=[
+        "iris_features_view:sepal_length",
+        "iris_features_view:sepal_width",
+        "iris_features_view:petal_length",
+        "iris_features_view:petal_width",
+        "iris_features_view:species",
+    ],
+    entity_rows=[{"iris_id": 1001}],
+).to_dict()
+
+features
+```
+
+Why this step:
+It queries the SQLite online store using the entity key (`iris_id`). If materialization worked, you’ll receive the latest feature values for iris_id=1001.
+
+======================================
+GET THE LATEST FEATURES FOR EACH IRIS_ID
+
+from feast import FeatureStore
+import pandas as pd
+
+fs = FeatureStore(repo_path="./feast_artifacts/iris_repo/feature_repo")
+
+entity_df = pd.DataFrame({
+    "iris_id": [1001, 1002, 1003],
+    # use a large dummy timestamp to fetch all history
+    "event_timestamp": pd.to_datetime("2100-01-01")
+})
+
+latest_df = fs.get_historical_features(
+    entity_df=entity_df,
+    features=[
+        "iris_features_view:sepal_length",
+        "iris_features_view:sepal_width",
+        "iris_features_view:petal_length",
+        "iris_features_view:petal_width",
+        "iris_features_view:species",
+    ]
+).to_df()
+
+=================================================
+FULL TRAINING DATAFRAME FOR MODEL BUILDING
+
+import pandas as pd
+
+df = pd.read_gbq(
+    "SELECT iris_id, event_timestamp FROM `mlops-iris-week1-graded.feast_iris.iris_features`",
+    project_id="mlops-iris-week1-graded"
+)
+
+from feast import FeatureStore
+fs = FeatureStore(repo_path="./feast_artifacts/iris_repo/feature_repo")
+
+full_training_df = fs.get_historical_features(
+    entity_df=df,
+    features=[
+        "iris_features_view:sepal_length",
+        "iris_features_view:sepal_width",
+        "iris_features_view:petal_length",
+        "iris_features_view:petal_width",
+        "iris_features_view:species",
+    ]
+).to_df()
+
+=========================================
+
+**Commands executed**
+
+1. **Create BigQuery dataset**
+   Run from anywhere:
+
+   ```
+   bq --project_id=mlops-iris-week1-graded --location=US mk -d feast_iris
+   ```
+
+2. **Load CSV into BigQuery**
+   Run from repo root:
+
+   ```
+   bq load --project_id=mlops-iris-week1-graded --location=US \
+   --source_format=CSV --autodetect feast_iris.iris_features \
+   ./iris_data_adapted_for_feast.csv
+   ```
+
+3. **Create Feast repo structure**
+   Run inside `feast_artifacts/`:
+
+   ```
+   feast init iris_repo
+   ```
+
+4. **Apply Feast repo**
+   Run inside:
+
+   ```
+   feast_artifacts/iris_repo/feature_repo
+   ```
+
+   Command:
+
+   ```
+   feast apply
+   ```
+
+5. **Materialize data to SQLite online store**
+   Run inside same folder:
+
+   ```
+   feast materialize-incremental "$(date +%Y-%m-%d)"
+   ```
+
+6. **Test online retrieval**
+   Python, executed inside:
+
+   ```
+   feast_artifacts/iris_repo/feature_repo
+   ```
+
+**Files created (no code, just locations)**
+
+1. `feast_artifacts/iris_repo/feature_repo/feature_store.yaml`
+   (overwritten with BigQuery + SQLite config)
+
+2. `feast_artifacts/iris_repo/feature_repo/iris_features.py`
+   (FeatureView + Entity + BigQuerySource)
+
+3. `feast_artifacts/iris_repo/registry.db`
+   (created by `feast apply`)
+
+4. `feast_artifacts/iris_repo/online_store.db`
+   (created + filled during materialization)
+
+This is the minimal end-to-end pipeline summary.

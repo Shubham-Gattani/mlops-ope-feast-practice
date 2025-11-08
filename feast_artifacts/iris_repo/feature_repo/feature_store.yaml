@@ -1,0 +1,13 @@
+project: iris_repo
+registry: ../registry.db
+
+provider: local
+
+offline_store:
+    type: bigquery
+    project_id: mlops-iris-week1-graded
+    dataset: feast_iris
+
+online_store:
+    type: sqlite
+    path: ../online_store.db
